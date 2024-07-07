@@ -14,6 +14,7 @@ struct Select {
     columns: Vec<ast::ResultColumn>,
     column_info: Vec<ColumnInfo>,
     from: Option<Table>,
+    order_by: Option<Vec<ast::SortedColumn>>,
     limit: Option<ast::Limit>,
     exist_aggregation: bool,
 }
@@ -81,6 +82,7 @@ fn build_select(schema: &Schema, select: ast::Select) -> Result<Select> {
                 columns,
                 column_info,
                 from: Some(table),
+                order_by: select.order_by.clone(),
                 limit: select.limit.clone(),
                 exist_aggregation,
             })
@@ -96,6 +98,7 @@ fn build_select(schema: &Schema, select: ast::Select) -> Result<Select> {
                 columns,
                 column_info,
                 from: None,
+                order_by: select.order_by.clone(),
                 limit: select.limit.clone(),
                 exist_aggregation,
             })
@@ -133,6 +136,16 @@ fn translate_select(select: Select) -> Result<Program> {
     let limit_insn = match (parsed_limit, &select.from) {
         (Some(0), _) => Some(program.emit_placeholder()),
         (_, Some(table)) => {
+            let sorter_cursor = match select.order_by {
+                Some(ref order_by) => {
+                    let sorter_cursor = program.alloc_cursor_id();
+                    program.emit_insn(Insn::SorterOpen {
+                        cursor_id: sorter_cursor,
+                    });
+                    Some((sorter_cursor, order_by))
+                }
+                None => None,
+            };
             let root_page = match table {
                 Table::BTree(table) => table.root_page,
                 Table::Pseudo(_) => todo!(),
@@ -144,6 +157,22 @@ fn translate_select(select: Select) -> Result<Program> {
             program.emit_insn(Insn::OpenReadAwait);
             program.emit_insn(Insn::RewindAsync { cursor_id });
             let rewind_await_offset = program.emit_placeholder();
+            if let Some((sorter_cursor_id, order_by)) = sorter_cursor {
+                for col in order_by {
+                    let col_name = match &col.expr {
+                        ast::Expr::Id(ident) => &ident.0,
+                        _ => todo!(),
+                    };
+                    let col = table.get_column(col_name).unwrap();
+                    let col_idx = col.0;
+                    let dest_reg = program.alloc_register();
+                    program.emit_insn(Insn::Column {
+                        column: col_idx,
+                        dest: dest_reg,
+                        cursor_id,
+                    });
+                }
+            };
             let (register_start, register_end) =
                 translate_columns(&mut program, Some(cursor_id), &select);
             let limit_insn = if select.exist_aggregation {
@@ -169,16 +198,59 @@ fn translate_select(select: Select) -> Result<Program> {
                 });
                 limit_reg.map(|_| program.emit_placeholder())
             } else {
-                program.emit_insn(Insn::ResultRow {
-                    start_reg: register_start,
-                    count: register_end - register_start,
-                });
+                if let Some((sorter_cursor, _)) = sorter_cursor {
+                    let record_reg = program.alloc_register();
+                    // FIXME: we need to translate some extra columns that are the key
+                    program.emit_insn(Insn::MakeRecord {
+                        start_reg: register_start,
+                        count: register_end - register_start,
+                        dest_reg: record_reg,
+                    });
+                    program.emit_insn(Insn::SorterInsert {
+                        cursor_id: sorter_cursor,
+                        record_reg,
+                    });
+                } else {
+                    program.emit_insn(Insn::ResultRow {
+                        start_reg: register_start,
+                        count: register_end - register_start,
+                    });
+                }
                 let limit_insn = limit_reg.map(|_| program.emit_placeholder());
                 program.emit_insn(Insn::NextAsync { cursor_id });
                 program.emit_insn(Insn::NextAwait {
                     cursor_id,
                     pc_if_next: rewind_await_offset,
                 });
+                if let Some((sorter_cursor_id, _)) = sorter_cursor {
+                    let pseudo_cursor_id = program.alloc_cursor_id();
+                    let pseudo_content_reg = program.alloc_register();
+                    let num_fields = 1; // FIXME
+                    program.emit_insn(Insn::OpenPseudo {
+                        cursor_id: pseudo_cursor_id,
+                        content_reg: pseudo_content_reg,
+                        num_fields,
+                    });
+                    program.emit_insn(Insn::SorterSort {
+                        cursor_id: sorter_cursor_id,
+                    });
+                    let sorter_data_offset = program.offset();
+                    program.emit_insn(Insn::SorterData {
+                        cursor_id: sorter_cursor_id,
+                        dest_reg: pseudo_content_reg,
+                    });
+                    // FIXME: translate columns from pseudo table
+                    let (register_start, register_end) =
+                        translate_columns(&mut program, Some(cursor_id), &select);
+                    program.emit_insn(Insn::ResultRow {
+                        start_reg: register_start,
+                        count: register_end - register_start,
+                    });
+                    program.emit_insn(Insn::SorterNext {
+                        cursor_id: sorter_cursor_id,
+                        pc_if_next: sorter_data_offset,
+                    });
+                }
                 limit_insn
             };
             program.fixup_insn(
